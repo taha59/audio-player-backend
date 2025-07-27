@@ -5,6 +5,8 @@ from pytubefix import Search, YouTube
 from flask_cors import CORS
 import base64
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 FRONTEND_URL = os.environ.get('FRONTEND_URL', '')
 
