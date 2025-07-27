@@ -20,7 +20,7 @@ CORS(app, resources={r"/search": {"origins": FRONTEND_URL},
 @app.route('/search', methods=['POST'])
 def search_youtube():
     search_query = request.form.get('searchQuery')
-    results = Search(search_query)
+    results = Search(search_query, 'WEB')
     video_dto = [
         {
             'title': video.title,
@@ -38,7 +38,7 @@ def download_video():
         return jsonify({"error": "No URL provided"}), 400
 
     try:
-        yt = YouTube(url)
+        yt = YouTube(url, 'WEB')
         stream = yt.streams.get_audio_only()
         if stream.filesize_mb > 200:
             return jsonify("File too large"), 413
