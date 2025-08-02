@@ -1,9 +1,12 @@
-from flask import Flask, jsonify, send_file, make_response, request
+from flask import Flask, jsonify, send_file, make_response, request, Response, stream_template
 from pytubefix import Search, YouTube
 from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 import traceback
+import json
+import time
+import threading
 
 load_dotenv()
 
@@ -15,44 +18,116 @@ app = Flask(__name__)
 
 CORS(app, resources={r"/*": {"origins": ["*"]}})
 
-@app.route('/search', methods=['POST'])
-def search_youtube():
-    search_query = request.form.get('searchQuery')
-    MAX_DURATION_SECONDS = 600  # 10 minutes
+@app.route('/search-stream', methods=['GET'])
+def search_stream():
+    """Streaming search endpoint that returns results progressively"""
+    query = request.args.get('q')
+    if not query:
+        return jsonify({"error": "No query provided"}), 400
     
-    results = Search(search_query)
-    video_dto = []
-    filtered_count = 0
-    
-    for video in results.videos:
+    def generate():
         try:
-            # Create YouTube object to get duration
-            yt = YouTube(video.watch_url)
-            duration_seconds = yt.length
+            MAX_DURATION_SECONDS = 600  # 10 minutes
+            MAX_RESULTS = 30  # Limit initial results
+            BATCH_SIZE = 5   # Send results in batches of 5
+            TIMEOUT_SECONDS = 15  # 15 second timeout
             
-            # Only include videos under the duration limit
-            if duration_seconds and duration_seconds <= MAX_DURATION_SECONDS:
-                video_dto.append({
-                    'title': video.title,
-                    'youtubeUrl': video.watch_url,
-                    'thumbnailUrl': video.thumbnail_url,
-                    'duration': duration_seconds
-                })
-            else:
-                filtered_count += 1
+            start_time = time.time()
+            
+            print(f"Starting streaming search for: {query}")
+            
+            # Get search results
+            search_results = Search(query)
+            total_videos = len(search_results.videos[:MAX_RESULTS])  # Limit to first 30
+            
+            video_batch = []
+            processed_count = 0
+            found_count = 0
+            filtered_count = 0
+            
+            for i, video in enumerate(search_results.videos[:MAX_RESULTS]):
+                # Check for timeout
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    # Send any remaining batch
+                    if video_batch:
+                        yield f"data: {json.dumps({'type': 'batch', 'results': video_batch})}\n\n"
+                    
+                    yield f"data: {json.dumps({'type': 'timeout', 'message': 'Search timeout - showing partial results'})}\n\n"
+                    return
+                
+                try:
+                    # Get video duration
+                    yt = YouTube(video.watch_url)
+                    duration_seconds = yt.length
+                    
+                    processed_count += 1
+                    
+                    # Filter by duration
+                    if duration_seconds and duration_seconds <= MAX_DURATION_SECONDS:
+                        video_data = {
+                            'title': video.title,
+                            'youtubeUrl': video.watch_url,
+                            'thumbnailUrl': video.thumbnail_url,
+                            'duration': duration_seconds
+                        }
+                        
+                        video_batch.append(video_data)
+                        found_count += 1
+                        
+                        # Send batch when it reaches BATCH_SIZE
+                        if len(video_batch) >= BATCH_SIZE:
+                            yield f"data: {json.dumps({'type': 'batch', 'results': video_batch})}\n\n"
+                            video_batch = []
+                    else:
+                        filtered_count += 1
+                    
+                    # Send progress update
+                    progress_data = {
+                        'type': 'progress',
+                        'processed': processed_count,
+                        'total': total_videos,
+                        'found': found_count
+                    }
+                    yield f"data: {json.dumps(progress_data)}\n\n"
+                    
+                except Exception as e:
+                    print(f"Error processing video {video.title}: {e}")
+                    processed_count += 1
+                    filtered_count += 1
+                    continue
+            
+            # Send any remaining videos in the batch
+            if video_batch:
+                yield f"data: {json.dumps({'type': 'batch', 'results': video_batch})}\n\n"
+            
+            # Send completion message
+            completion_data = {
+                'type': 'complete',
+                'total': total_videos,
+                'totalFound': found_count,
+                'filteredCount': filtered_count,
+                'maxDurationMinutes': MAX_DURATION_SECONDS / 60
+            }
+            yield f"data: {json.dumps(completion_data)}\n\n"
+            
+            print(f"Streaming search completed. Found {found_count} results, filtered {filtered_count}")
+            
         except Exception as e:
-            print(f"Error getting duration for {video.title}: {e}")
-            filtered_count += 1
-            continue
+            print(f"Error in streaming search: {e}")
+            traceback.print_exc()
+            error_data = {
+                'type': 'error',
+                'message': f'Search failed: {str(e)}'
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
     
-    print(f"Filtered out {filtered_count} videos over {MAX_DURATION_SECONDS/60} minutes")
-    return jsonify({
-        'results': video_dto,
-        'filteredCount': filtered_count,
-        'maxDurationMinutes': MAX_DURATION_SECONDS / 60
-    })
-
-
+    response = Response(generate(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['Connection'] = 'keep-alive'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Cache-Control'
+    
+    return response
 
 @app.route('/download-video', methods=['POST'])
 def download_video():
