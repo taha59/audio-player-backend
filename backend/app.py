@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, send_file, make_response, request, Response, stream_template
+from flask import Flask, jsonify, request, Response
 from pytubefix import Search, YouTube
 from flask_cors import CORS
 import os
@@ -7,6 +7,7 @@ import traceback
 import json
 import time
 import threading
+import io
 
 load_dotenv()
 
@@ -18,6 +19,10 @@ app = Flask(__name__)
 
 CORS(app, resources={r"/*": {"origins": ["*"]}})
 
+@app.route("/")
+def index():
+    return "Flask backend is alive!"
+
 @app.route('/search-stream', methods=['GET'])
 def search_stream():
     """Streaming search endpoint that returns results progressively"""
@@ -28,9 +33,9 @@ def search_stream():
     def generate():
         try:
             MAX_DURATION_SECONDS = 600  # 10 minutes
-            MAX_RESULTS = 30  # Limit initial results
-            BATCH_SIZE = 5   # Send results in batches of 5
-            TIMEOUT_SECONDS = 15  # 15 second timeout
+            MAX_RESULTS = 10  # Limit initial results
+            BATCH_SIZE = 1   # Send results in batches of 1
+            TIMEOUT_SECONDS = 10  # 10 second timeout
             
             start_time = time.time()
             
@@ -38,7 +43,7 @@ def search_stream():
             
             # Get search results
             search_results = Search(query)
-            total_videos = len(search_results.videos[:MAX_RESULTS])  # Limit to first 30
+            total_videos = len(search_results.videos[:MAX_RESULTS])  # Limit to first 10
             
             video_batch = []
             processed_count = 0
@@ -131,6 +136,8 @@ def search_stream():
 
 @app.route('/download-video', methods=['POST'])
 def download_video():
+
+    FILE_SIZE_LIMIT_MB = 50
     url = request.form.get('youtubeUrl')
     if not url:
         print('Missing youtubeUrl field!')
@@ -146,41 +153,35 @@ def download_video():
             print("[ERROR] No valid mp4 stream found for this URL!")
             return jsonify({"error": "No valid mp4 stream found"}), 404
 
-        if getattr(stream, 'filesize_mb', 0) > 200:
+        if getattr(stream, 'filesize_mb', 0) > FILE_SIZE_LIMIT_MB:
             print("[ERROR] Requested video too large: ", getattr(stream, 'filesize_mb', 0), "MB")
             return jsonify("File too large"), 413
 
-        ext = stream.subtype
-        file_name = f"tempvideo.{ext}"
-        file_path = os.path.join(TMP_DIR, file_name)
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        buffer = io.BytesIO()
+        stream.stream_to_buffer(buffer)
+        buffer.seek(0)
 
-        print("Downloading video to: ", file_path)
-        stream.download(output_path=os.path.dirname(file_path), filename=os.path.basename(file_path))
+        def generate():
+            chunk_size = 1024 * 64  # 64 KB chunks
+            while True:
+                chunk = buffer.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
 
-        # === File existence and size check ===
-        if not os.path.exists(file_path):
-            print("[ERROR] File does not exist after download:", file_path)
-            return jsonify({"error": "Download failed: file not found"}), 500
-        file_size = os.path.getsize(file_path)
-        print(f"[INFO] Downloaded file size: {file_size} bytes")
-        if file_size == 0:
-            print("[ERROR] Downloaded file is 0 bytes!")
-            return jsonify({"error": "Download failed: empty file"}), 500
-
-        response = make_response(send_file(
-            file_path,
-            as_attachment=True,
-            download_name=f"temp_video.{ext}",
-            mimetype='video/mp4'
-        ))
-        print("[SUCCESS] Sending file to client.")
-        return response
+        return Response(
+            generate(),
+            mimetype='video/mp4',
+            headers={
+                'Content-Disposition': 'attachment; filename="video.mp4"'
+            }
+        )
 
     except Exception as e:
         print(f"[ERROR] Exception during /download-video: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Download failed: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
