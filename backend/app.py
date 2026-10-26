@@ -8,6 +8,9 @@ import json
 import time
 import threading
 import io
+import yt_dlp
+import requests
+import re
 
 load_dotenv()
 
@@ -32,7 +35,7 @@ def search_stream():
     
     def generate():
         try:
-            MAX_DURATION_SECONDS = 600  # 10 minutes
+            MAX_DURATION_SECONDS = 6000  # 10 minutes
             MAX_RESULTS = 10  # Limit initial results
             BATCH_SIZE = 1   # Send results in batches of 1
             TIMEOUT_SECONDS = 10  # 10 second timeout
@@ -137,7 +140,7 @@ def search_stream():
 @app.route('/download-video', methods=['POST'])
 def download_video():
 
-    FILE_SIZE_LIMIT_MB = 50
+    FILE_SIZE_LIMIT_MB = 500
     url = request.form.get('youtubeUrl')
     if not url:
         print('Missing youtubeUrl field!')
@@ -147,7 +150,7 @@ def download_video():
 
     try:
         yt = YouTube(url)
-        stream = yt.streams.filter(file_extension='mp4').get_highest_resolution()
+        stream = yt.streams.filter(file_extension='mp4').get_lowest_resolution()
         print("Stream object: ", stream)
         if not stream:
             print("[ERROR] No valid mp4 stream found for this URL!")
@@ -169,18 +172,66 @@ def download_video():
                     break
                 yield chunk
 
+        headers = {"Accept-Ranges": "bytes"}
         return Response(
             generate(),
             mimetype='video/mp4',
-            headers={
-                'Content-Disposition': 'attachment; filename="video.mp4"'
-            }
+            headers=headers
         )
 
     except Exception as e:
         print(f"[ERROR] Exception during /download-video: {e}")
         traceback.print_exc()
-        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+        return jsonify({"error": f"Download failed!"}), 500
+
+@app.route("/stream-video", methods=["GET"])
+def stream_video():
+    url = request.args.get("youtubeUrl")
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    try:
+
+        yt = YouTube(url)
+        stream = yt.streams.filter(file_extension='mp4').get_lowest_resolution()
+
+        buffer = io.BytesIO()  # in-memory buffer
+        stream.stream_to_buffer(buffer)
+        buffer.seek(0)
+        size = buffer.getbuffer().nbytes
+
+        range_header = request.headers.get("Range", None)
+        if range_header:
+            # Parse "bytes=start-end"
+            match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+            if match:
+                start = int(match.group(1))
+                end = int(match.group(2)) if match.group(2) else size - 1
+            else:
+                start = 0
+                end = size - 1
+
+            buffer.seek(start)
+            data = buffer.read(end - start + 1)
+
+            resp = Response(data, status=206, mimetype="audio/mp4")
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Length"] = str(len(data))
+            return resp
+        else:
+            # No Range header: return full content
+            buffer.seek(0)
+            data = buffer.read()
+            resp = Response(data, status=200, mimetype="audio/mp4")
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Length"] = str(size)
+            return resp
+    except Exception as e:
+        print(f"[ERROR] Exception during /stream-video: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Streaming failed: {str(e)}"}), 500
+
 
 
 if __name__ == '__main__':
